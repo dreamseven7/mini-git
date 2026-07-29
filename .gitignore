@@ -1,11 +1,25 @@
-# 忽略编译产物
+# 编译产物
 *.exe
 
-# 忽略 xit 内部仓库数据
+# xit 内部仓库数据
 .xit/
 
-# 忽略编辑器临时文件
+# 编辑器临时文件
 .vs/
 .vscode/
 *.suo
 *.user
+
+# 测试临时文件
+a.txt
+b.txt
+c.txt
+shared.txt
+old.txt
+new.txt
+diff_*.txt
+test_env.txt
+test.sh
+tmp_test/
+scratch_test/
+no_init_test/
