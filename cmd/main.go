@@ -1,11 +1,13 @@
 // cmd/main.go — xit 命令行入口
 //
-// v2 新增：add / commit / log 三个命令，以及 getHeadBranch / getBranchRef / setBranchRef 辅助函数
-// v2 改进：cmdInit 现在会自动创建 .xit/HEAD 文件（之前忘了这茬）
+// v4 加了 branch 和 merge：
+//   xit branch               列出分支
+//   xit branch <名字>         创建分支
+//   xit branch -d <名字>      删除分支
+//   xit merge <分支>          合并分支
 //
-// 写这个项目的时候一直在想：Git 到底是怎么工作的？
-// 边看资料边敲代码，很多东西试了好几种写法才确定下来。
-// 注释里会记一些当时的想法和踩过的坑。
+// 顺带把 Commit.Parent 改成了 Parents（支持多个），
+// 这样合并提交就能有两个爸爸了。
 package main
 
 import (
@@ -13,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +30,14 @@ func main() {
 	}
 
 	command := os.Args[1]
+
+	if command != "init" && command != "help" && command != "--help" {
+		if !isRepoInit() {
+			fmt.Println("错误：当前目录不是 xit 仓库（或找不到 .xit 目录）")
+			fmt.Println("请先执行 xit init")
+			return
+		}
+	}
 
 	switch command {
 	case "init":
@@ -49,28 +60,51 @@ func main() {
 			return
 		}
 		cmdLsTree(os.Args[2])
-	// v2 新增的三个命令
 	case "add":
 		if len(os.Args) < 3 {
-			fmt.Println("用法: xit add <文件路径>")
+			fmt.Println("用法: xit add <文件路径...>")
 			return
 		}
-		cmdAdd(os.Args[2])
+		cmdAdd(os.Args[2:])
 	case "commit":
-		msg := ""
-		for i := 2; i < len(os.Args)-1; i++ {
-			if os.Args[i] == "-m" {
-				msg = os.Args[i+1]
-				break
+		msgs := []string{}
+		for i := 2; i < len(os.Args); i++ {
+			if os.Args[i] == "-m" && i+1 < len(os.Args) {
+				msgs = append(msgs, os.Args[i+1])
+				i++
 			}
 		}
-		if msg == "" {
-			fmt.Println("用法: xit commit -m \"提交信息\"")
+		if len(msgs) == 0 {
+			fmt.Println("用法: xit commit -m \"信息\" [-m \"更多信息\"]")
 			return
 		}
-		cmdCommit(msg)
+		cmdCommit(strings.Join(msgs, "\n\n"))
 	case "log":
 		cmdLog()
+	case "status":
+		cmdStatus()
+	case "checkout":
+		if len(os.Args) < 3 {
+			fmt.Println("用法: xit checkout <哈希值> -- <文件>")
+			fmt.Println("       xit checkout <分支名>")
+			return
+		}
+		cmdCheckout(os.Args[2:])
+	case "diff":
+		if len(os.Args) < 3 {
+			fmt.Println("用法: xit diff <哈希1> <哈希2>")
+			return
+		}
+		cmdDiff(os.Args[2], os.Args[3])
+	// v4 新增
+	case "branch":
+		cmdBranch(os.Args[2:])
+	case "merge":
+		if len(os.Args) < 3 {
+			fmt.Println("用法: xit merge <分支名>")
+			return
+		}
+		cmdMerge(os.Args[2])
 	default:
 		fmt.Printf("未知命令: %s\n", command)
 		printUsage()
@@ -83,14 +117,227 @@ func printUsage() {
 	fmt.Println("  xit hash-object <文件> -- 把文件存为 blob 对象")
 	fmt.Println("  xit cat-file <哈希>    -- 查看对象内容")
 	fmt.Println("  xit ls-tree <哈希>     -- 查看 tree 对象的内容")
-	// v2 新增
-	fmt.Println("  xit add <文件>         -- 暂存文件")
-	fmt.Println("  xit commit -m \"信息\"   -- 创建提交")
+	fmt.Println("  xit add <文件...>      -- 暂存文件（支持 *.go 通配符）")
+	fmt.Println("  xit commit -m \"信息\"   -- 创建提交（多个 -m 自动拼接）")
 	fmt.Println("  xit log                -- 查看提交历史")
+	fmt.Println("  xit status             -- 查看工作区状态")
+	fmt.Println("  xit checkout <哈希> -- <文件>  -- 恢复文件")
+	fmt.Println("  xit checkout <分支>    -- 切换分支")
+	fmt.Println("  xit diff <哈希1> <哈希2> -- 比较差异")
+	// v4
+	fmt.Println("  xit branch             -- 列出分支")
+	fmt.Println("  xit branch <名字>      -- 创建分支")
+	fmt.Println("  xit branch -d <名字>   -- 删除分支")
+	fmt.Println("  xit merge <分支>       -- 合并分支到当前分支")
 }
 
-// cmdInit 初始化仓库
-// v2 改了：加了创建 HEAD 文件的逻辑，不然 commit 不知道当前在哪个分支
+// ===== 辅助函数 =====
+
+func isRepoInit() bool {
+	_, err := os.Stat(".xit/HEAD")
+	return err == nil
+}
+
+func getAuthor() string {
+	if a := os.Getenv("XIT_AUTHOR"); a != "" {
+		return a
+	}
+	return "xit 用户 <user@xit>"
+}
+
+func getHeadBranch() string {
+	data, err := os.ReadFile(".xit/HEAD")
+	if err != nil {
+		return "main"
+	}
+	line := strings.TrimSpace(string(data))
+	if strings.HasPrefix(line, "ref: ") {
+		parts := strings.Split(line, "/")
+		return parts[len(parts)-1]
+	}
+	return "main"
+}
+
+func getBranchRef(branch string) string {
+	refPath := filepath.Join(".xit", "refs", "heads", branch)
+	data, err := os.ReadFile(refPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func setBranchRef(branch, hash string) error {
+	refPath := filepath.Join(".xit", "refs", "heads", branch)
+	dir := filepath.Dir(refPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(refPath, []byte(hash+"\n"), 0644)
+}
+
+func getCommitTreeHash(hash string) string {
+	data, err := store.Read(hash)
+	if err != nil {
+		return ""
+	}
+	var content []byte
+	for i, b := range data {
+		if b == 0 {
+			content = data[i+1:]
+			break
+		}
+	}
+	if content == nil {
+		return ""
+	}
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "tree ") {
+			return strings.TrimPrefix(line, "tree ")
+		}
+	}
+	return ""
+}
+
+func getFilesFromTree(treeHash string) map[string]string {
+	result := map[string]string{}
+	if treeHash == "" {
+		return result
+	}
+	collectTreeFiles(treeHash, "", result)
+	return result
+}
+
+func collectTreeFiles(treeHash, prefix string, result map[string]string) {
+	data, err := store.Read(treeHash)
+	if err != nil {
+		return
+	}
+	var content []byte
+	for i, b := range data {
+		if b == 0 {
+			content = data[i+1:]
+			break
+		}
+	}
+	if content == nil {
+		return
+	}
+
+	reader := bufio.NewReader(strings.NewReader(string(content)))
+	for {
+		nameWithMode, err := reader.ReadString(0)
+		if err != nil {
+			break
+		}
+		nameWithMode = strings.TrimRight(nameWithMode, "\x00")
+		parts := strings.SplitN(nameWithMode, " ", 2)
+		if len(parts) < 2 {
+			break
+		}
+		mode := parts[0]
+		name := parts[1]
+
+		hashBytes := make([]byte, 20)
+		_, err = reader.Read(hashBytes)
+		if err != nil {
+			break
+		}
+		hash := fmt.Sprintf("%x", hashBytes)
+		fullPath := filepath.Join(prefix, name)
+
+		if strings.HasPrefix(mode, "04") {
+			collectTreeFiles(hash, fullPath, result)
+		} else {
+			result[fullPath] = hash
+		}
+	}
+}
+
+func getFileMode(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "100644"
+	}
+	mode := info.Mode()
+	if mode&0100 != 0 {
+		return "100755"
+	}
+	return "100644"
+}
+
+// commitInfo 解析 commit 对象的结果
+type commitInfo struct {
+	treeHash   string
+	parents    []string // v4 改成数组
+	author     string
+	timestamp  int64
+	message    string
+}
+
+func parseCommit(hash string) *commitInfo {
+	data, err := store.Read(hash)
+	if err != nil {
+		return nil
+	}
+	var content []byte
+	for i, b := range data {
+		if b == 0 {
+			content = data[i+1:]
+			break
+		}
+	}
+	if content == nil {
+		return nil
+	}
+
+	lines := strings.Split(string(content), "\n")
+	info := &commitInfo{}
+	msgStart := 0
+
+	for i, line := range lines {
+		if strings.HasPrefix(line, "tree ") {
+			info.treeHash = strings.TrimPrefix(line, "tree ")
+		} else if strings.HasPrefix(line, "parent ") {
+			info.parents = append(info.parents, strings.TrimPrefix(line, "parent "))
+		} else if strings.HasPrefix(line, "author ") {
+			info.author = strings.TrimPrefix(line, "author ")
+		} else if strings.HasPrefix(line, "timestamp ") {
+			ts := strings.TrimPrefix(line, "timestamp ")
+			info.timestamp, _ = strconv.ParseInt(ts, 10, 64)
+		} else if line == "" {
+			msgStart = i + 1
+			break
+		}
+	}
+
+	msgLines := lines[msgStart:]
+	info.message = strings.TrimSpace(strings.Join(msgLines, "\n"))
+	return info
+}
+
+// isAncestor 检查某个 commit 是不是另一个的祖先
+// 用来判断能不能快进合并。从 target 开始沿着 parent 向上找，
+// 如果能找到 base，说明 base 是 target 的祖先。
+func isAncestor(ancestorHash, targetHash string) bool {
+	if ancestorHash == targetHash {
+		return true
+	}
+	info := parseCommit(targetHash)
+	if info == nil {
+		return false
+	}
+	for _, p := range info.parents {
+		if isAncestor(ancestorHash, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// ===== 原始命令 =====
+
 func cmdInit() {
 	err := store.Init()
 	if err != nil {
@@ -98,7 +345,6 @@ func cmdInit() {
 		return
 	}
 
-	// 默认分支叫 main，不叫 master 了
 	headDir := filepath.Dir(".xit/HEAD")
 	os.MkdirAll(headDir, 0755)
 	os.WriteFile(".xit/HEAD", []byte("ref: refs/heads/main\n"), 0644)
@@ -112,18 +358,12 @@ func cmdHashObject(filePath string) {
 		fmt.Printf("读取文件失败 %s: %v\n", filePath, err)
 		return
 	}
-
-	blob := &object.Blob{
-		Size: len(data),
-		Data: data,
-	}
-
+	blob := &object.Blob{Size: len(data), Data: data}
 	hash, err := store.Write(blob)
 	if err != nil {
 		fmt.Printf("写入对象失败: %v\n", err)
 		return
 	}
-
 	fmt.Println(hash)
 }
 
@@ -133,15 +373,12 @@ func cmdCatFile(hash string) {
 		fmt.Printf("读取对象失败 %s: %v\n", hash, err)
 		return
 	}
-
-	// 找 \x00 分隔符，后面的才是真数据
 	for i, b := range data {
 		if b == 0 {
 			fmt.Print(string(data[i+1:]))
 			return
 		}
 	}
-
 	fmt.Print(string(data))
 }
 
@@ -151,7 +388,6 @@ func cmdLsTree(hash string) {
 		fmt.Printf("读取对象失败 %s: %v\n", hash, err)
 		return
 	}
-
 	var content []byte
 	for i, b := range data {
 		if b == 0 {
@@ -159,20 +395,17 @@ func cmdLsTree(hash string) {
 			break
 		}
 	}
-
 	if content == nil {
 		fmt.Println("无效的 tree 对象")
 		return
 	}
 
 	reader := bufio.NewReader(strings.NewReader(string(content)))
-
 	for {
 		nameWithMode, err := reader.ReadString(0)
 		if err != nil {
 			break
 		}
-
 		nameWithMode = strings.TrimRight(nameWithMode, "\x00")
 		parts := strings.SplitN(nameWithMode, " ", 2)
 
@@ -191,88 +424,52 @@ func cmdLsTree(hash string) {
 			mode = parts[0]
 			name = ""
 		}
-
 		fmt.Printf("%s %s\t%s\n", mode, fmt.Sprintf("%x", hashBytes), name)
 	}
 }
 
-// ===== v2 新增：以下都是辅助函数和新命令 =====
-
-// getHeadBranch 读 HEAD 文件得到当前分支名
-// 比如 "ref: refs/heads/main" → 返回 "main"
-// 文件不存在就默认 main（兼容旧版 xit init 创建的仓库）
-func getHeadBranch() string {
-	data, err := os.ReadFile(".xit/HEAD")
-	if err != nil {
-		return "main"
+func cmdAdd(args []string) {
+	files := []string{}
+	for _, arg := range args {
+		if strings.ContainsAny(arg, "*?[") {
+			matches, err := filepath.Glob(arg)
+			if err != nil {
+				fmt.Printf("通配符解析失败 %s: %v\n", arg, err)
+				continue
+			}
+			files = append(files, matches...)
+		} else {
+			files = append(files, arg)
+		}
 	}
-	line := strings.TrimSpace(string(data))
-	if strings.HasPrefix(line, "ref: ") {
-		parts := strings.Split(line, "/")
-		return parts[len(parts)-1]
-	}
-	return "main"
-}
-
-// getBranchRef 读分支文件，拿到最新的 commit 哈希
-// 还没提交过就返回空字符串
-func getBranchRef(branch string) string {
-	refPath := filepath.Join(".xit", "refs", "heads", branch)
-	data, err := os.ReadFile(refPath)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
-}
-
-// setBranchRef 更新分支指向的 commit 哈希
-// commit 成功后调用这个
-func setBranchRef(branch, hash string) error {
-	refPath := filepath.Join(".xit", "refs", "heads", branch)
-	dir := filepath.Dir(refPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-	return os.WriteFile(refPath, []byte(hash+"\n"), 0644)
-}
-
-// cmdAdd 暂存文件：读文件 → 存成 blob → 写入 index
-func cmdAdd(filePath string) {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		fmt.Printf("读取文件失败 %s: %v\n", filePath, err)
+	if len(files) == 0 {
+		fmt.Println("没有匹配的文件")
 		return
 	}
-
-	blob := &object.Blob{
-		Size: len(data),
-		Data: data,
+	for _, filePath := range files {
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			fmt.Printf("读取文件失败 %s: %v\n", filePath, err)
+			continue
+		}
+		blob := &object.Blob{Size: len(data), Data: data}
+		hash, err := store.Write(blob)
+		if err != nil {
+			fmt.Printf("存储对象失败 %s: %v\n", filePath, err)
+			continue
+		}
+		mode := getFileMode(filePath)
+		err = store.AddToIndex(mode, hash, filePath)
+		if err != nil {
+			fmt.Printf("添加到暂存区失败 %s: %v\n", filePath, err)
+			continue
+		}
+		fmt.Printf("已暂存 %s（%s）\n", filePath, hash)
 	}
-	hash, err := store.Write(blob)
-	if err != nil {
-		fmt.Printf("存储对象失败: %v\n", err)
-		return
-	}
-
-	// 100644 是普通文件，可执行文件应该是 100755，回头再处理
-	err = store.AddToIndex("100644", hash, filePath)
-	if err != nil {
-		fmt.Printf("添加到暂存区失败: %v\n", err)
-		return
-	}
-
-	fmt.Printf("已暂存 %s（%s）\n", filePath, hash)
 }
 
-// cmdCommit 提交：读 index → 建 tree → 建 commit → 更新分支 → 清空 index
-//
-// 当时写这个函数的时候有个纠结：commit 完了要不要清空 index？
-// 想了想还是要清，因为 index 里的文件已经被"消费"了，
-// 下次 commit 前得重新 add。Git 也是这么干的。
-//
-// 还有个问题：如果第 2 步（写 tree）成功了，第 4 步（写 commit）失败了，
-// 就会留下一个没人引用的 tree 对象。真正的 Git 有 gc 来回收，
-// xit 暂时不管了，反正不影响仓库完整性。
+// cmdCommit 提交
+// v4 改用 Parents 数组，但普通提交只有一个 parent，逻辑不变
 func cmdCommit(message string) {
 	entries, err := store.ReadIndex()
 	if err != nil {
@@ -301,11 +498,17 @@ func cmdCommit(message string) {
 	branch := getHeadBranch()
 	parentHash := getBranchRef(branch)
 
+	parents := []string{}
+	if parentHash != "" {
+		parents = append(parents, parentHash)
+	}
+
 	commit := &object.Commit{
 		TreeHash: treeHash,
-		Parent:   parentHash,
-		Author:   "xit 用户 <user@xit>",
+		Parents:  parents,
+		Author:   getAuthor(),
 		Message:  message,
+		Time:     time.Now(),
 	}
 	commitHash, err := store.Write(commit)
 	if err != nil {
@@ -318,7 +521,6 @@ func cmdCommit(message string) {
 		return
 	}
 
-	// 提交完了，清空暂存区
 	if err := store.WriteIndex(nil); err != nil {
 		fmt.Printf("清空暂存区失败: %v\n", err)
 		return
@@ -328,11 +530,8 @@ func cmdCommit(message string) {
 	fmt.Printf("  %d 个文件已提交\n", len(entries))
 }
 
-// cmdLog 从最新 commit 开始沿着 parent 链往回打印
-//
-// 有个偷懒的地方：日期用了当前时间而不是 commit 里的时间。
-// 因为 Commit 结构体当时设计的时候忘了加时间字段……回头补上。
-// TODO: 在 Commit 里加 Time 字段
+// cmdLog 查看提交历史
+// v4 适配了多 parent：合并提交会显示所有 parent，遍历时只走第一个
 func cmdLog() {
 	branch := getHeadBranch()
 	hash := getBranchRef(branch)
@@ -346,10 +545,144 @@ func cmdLog() {
 	fmt.Println(strings.Repeat("-", 50))
 
 	for hash != "" {
-		data, err := store.Read(hash)
-		if err != nil {
-			fmt.Printf("读取 commit 失败: %v\n", err)
+		info := parseCommit(hash)
+		if info == nil {
 			break
+		}
+
+		fmt.Printf("提交: %s\n", hash)
+		if len(info.parents) > 0 {
+			if len(info.parents) == 1 {
+				fmt.Printf("父提交: %s\n", info.parents[0])
+			} else {
+				// 合并提交有多个 parent
+				fmt.Printf("合并: %s\n", strings.Join(info.parents, ", "))
+			}
+		}
+		fmt.Printf("作者: %s\n", info.author)
+		t := time.Unix(info.timestamp, 0)
+		fmt.Printf("日期: %s\n", t.Format("2006-01-02 15:04:05"))
+		fmt.Printf("\n    %s\n\n", info.message)
+
+		// 沿第一个 parent 走（和 git log 默认行为一致）
+		if len(info.parents) > 0 {
+			hash = info.parents[0]
+		} else {
+			hash = ""
+		}
+
+		if hash != "" {
+			fmt.Println(strings.Repeat("-", 50))
+		}
+	}
+}
+
+// cmdStatus 查看状态
+func cmdStatus() {
+	branch := getHeadBranch()
+	commitHash := getBranchRef(branch)
+
+	entries, _ := store.ReadIndex()
+	if len(entries) > 0 {
+		fmt.Println("要提交的变更：")
+		for _, e := range entries {
+			fmt.Printf("  新文件: %s\n", e.Name)
+		}
+		fmt.Println()
+	} else {
+		fmt.Println("无要提交的变更（使用 xit add 暂存文件）")
+		fmt.Println()
+	}
+
+	if commitHash != "" {
+		treeHash := getCommitTreeHash(commitHash)
+		headFiles := getFilesFromTree(treeHash)
+
+		modified := 0
+		for path, hash := range headFiles {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			blob := &object.Blob{Size: len(data), Data: data}
+			currentHash := object.Hash(blob)
+			if currentHash != hash {
+				if modified == 0 {
+					fmt.Println("未暂存的变更：")
+				}
+				fmt.Printf("  修改: %s\n", path)
+				modified++
+			}
+		}
+		if modified > 0 {
+			fmt.Println()
+		}
+	}
+
+	untracked := []string{}
+	headFiles := map[string]bool{}
+	if commitHash != "" {
+		treeHash := getCommitTreeHash(commitHash)
+		for k := range getFilesFromTree(treeHash) {
+			headFiles[k] = true
+		}
+	}
+	stagedFiles := map[string]bool{}
+	for _, e := range entries {
+		stagedFiles[e.Name] = true
+	}
+
+	filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if strings.HasPrefix(path, ".xit") || strings.HasPrefix(path, ".git") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if headFiles[path] || stagedFiles[path] {
+			return nil
+		}
+		if strings.HasSuffix(path, ".exe") || strings.HasPrefix(path, ".") {
+			return nil
+		}
+		untracked = append(untracked, path)
+		return nil
+	})
+
+	if len(untracked) > 0 {
+		fmt.Println("未跟踪的文件：")
+		for _, f := range untracked {
+			fmt.Printf("  %s\n", f)
+		}
+		fmt.Println()
+	}
+}
+
+func cmdCheckout(args []string) {
+	if len(args) >= 3 && args[1] == "--" {
+		hash := args[0]
+		filePath := args[2]
+
+		treeHash := getCommitTreeHash(hash)
+		if treeHash == "" {
+			fmt.Printf("找不到 commit: %s\n", hash)
+			return
+		}
+
+		files := getFilesFromTree(treeHash)
+		blobHash, ok := files[filePath]
+		if !ok {
+			fmt.Printf("在 commit %s 中找不到文件 %s\n", hash, filePath)
+			return
+		}
+
+		data, err := store.Read(blobHash)
+		if err != nil {
+			fmt.Printf("读取对象失败: %v\n", err)
+			return
 		}
 
 		var content []byte
@@ -360,41 +693,213 @@ func cmdLog() {
 			}
 		}
 		if content == nil {
-			break
+			content = data
 		}
 
-		lines := strings.Split(string(content), "\n")
+		os.WriteFile(filePath, content, 0644)
+		fmt.Printf("已恢复 %s 到 commit %s 时的版本\n", filePath, hash[:8])
+		return
+	}
 
-		parentHash := ""
-		author := ""
-		msgStart := 0
+	branchName := args[0]
+	commitHash := getBranchRef(branchName)
+	if commitHash == "" {
+		fmt.Printf("分支不存在: %s\n", branchName)
+		return
+	}
 
-		for i, line := range lines {
-			if strings.HasPrefix(line, "parent ") {
-				parentHash = strings.TrimPrefix(line, "parent ")
-			} else if strings.HasPrefix(line, "author ") {
-				author = strings.TrimPrefix(line, "author ")
-			} else if line == "" {
-				msgStart = i + 1
-				break
+	os.WriteFile(".xit/HEAD", []byte(fmt.Sprintf("ref: refs/heads/%s\n", branchName)), 0644)
+	fmt.Printf("已切换到分支 '%s'\n", branchName)
+}
+
+func cmdDiff(hash1, hash2 string) {
+	data1, err := store.Read(hash1)
+	if err != nil {
+		fmt.Printf("读取对象失败 %s: %v\n", hash1, err)
+		return
+	}
+	data2, err := store.Read(hash2)
+	if err != nil {
+		fmt.Printf("读取对象失败 %s: %v\n", hash2, err)
+		return
+	}
+
+	content1 := skipHeader(data1)
+	content2 := skipHeader(data2)
+
+	lines1 := strings.Split(string(content1), "\n")
+	lines2 := strings.Split(string(content2), "\n")
+
+	maxLen := len(lines1)
+	if len(lines2) > maxLen {
+		maxLen = len(lines2)
+	}
+
+	fmt.Printf("--- %s\n", hash1[:8])
+	fmt.Printf("+++ %s\n", hash2[:8])
+
+	for i := 0; i < maxLen; i++ {
+		line1 := ""
+		line2 := ""
+		if i < len(lines1) {
+			line1 = lines1[i]
+		}
+		if i < len(lines2) {
+			line2 = lines2[i]
+		}
+		if line1 != line2 {
+			if i < len(lines1) {
+				fmt.Printf("-%s\n", line1)
+			}
+			if i < len(lines2) {
+				fmt.Printf("+%s\n", line2)
 			}
 		}
+	}
+}
 
-		msgLines := lines[msgStart:]
-		message := strings.TrimSpace(strings.Join(msgLines, "\n"))
-
-		fmt.Printf("提交: %s\n", hash)
-		if parentHash != "" {
-			fmt.Printf("父提交: %s\n", parentHash)
-		}
-		fmt.Printf("作者: %s\n", author)
-		fmt.Printf("日期: %s\n", time.Now().Format("2006-01-02 15:04:05"))
-		fmt.Printf("\n    %s\n\n", message)
-
-		hash = parentHash
-
-		if hash != "" {
-			fmt.Println(strings.Repeat("-", 50))
+func skipHeader(data []byte) []byte {
+	for i, b := range data {
+		if b == 0 {
+			return data[i+1:]
 		}
 	}
+	return data
+}
+
+// ===== v4 新增：branch / merge =====
+
+// cmdBranch 分支管理
+//
+// 三种用法：
+//   xit branch          → 列出所有分支，当前分支标 *
+//   xit branch <名字>   → 创建新分支（指向当前 HEAD）
+//   xit branch -d <名字> → 删除分支
+func cmdBranch(args []string) {
+	// 没参数 = 列出分支
+	if len(args) == 0 {
+		current := getHeadBranch()
+		entries, err := os.ReadDir(filepath.Join(".xit", "refs", "heads"))
+		if err != nil {
+			fmt.Printf("读取分支列表失败: %v\n", err)
+			return
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if name == current {
+				fmt.Printf("* %s\n", name)
+			} else {
+				fmt.Printf("  %s\n", name)
+			}
+		}
+		return
+	}
+
+	// -d = 删除分支
+	if args[0] == "-d" {
+		if len(args) < 2 {
+			fmt.Println("用法: xit branch -d <分支名>")
+			return
+		}
+		name := args[1]
+		current := getHeadBranch()
+		if name == current {
+			fmt.Printf("错误：不能删除当前所在的分支 '%s'\n", name)
+			return
+		}
+		refPath := filepath.Join(".xit", "refs", "heads", name)
+		if err := os.Remove(refPath); err != nil {
+			fmt.Printf("删除分支失败: %v\n", err)
+			return
+		}
+		fmt.Printf("已删除分支 '%s'\n", name)
+		return
+	}
+
+	// 创建分支
+	name := args[0]
+	hash := getBranchRef(name)
+	if hash != "" {
+		fmt.Printf("错误：分支 '%s' 已存在\n", name)
+		return
+	}
+
+	currentHash := getBranchRef(getHeadBranch())
+	if currentHash == "" {
+		fmt.Println("错误：当前分支没有提交记录，无法创建分支")
+		return
+	}
+
+	if err := setBranchRef(name, currentHash); err != nil {
+		fmt.Printf("创建分支失败: %v\n", err)
+		return
+	}
+	fmt.Printf("已创建分支 '%s'（指向 %s）\n", name, currentHash[:8])
+}
+
+// cmdMerge 合并分支到当前分支
+//
+// 两种情况：
+//   1. 快进合并（fast-forward）：当前分支是目标分支的祖先，直接把指针往前移
+//   2. 合并提交：两条分叉的历史，创建一个合并 commit（两个 parent）
+//
+// 合并 commit 的 tree 用的是当前分支的 tree（简单处理，不搞三路合并）
+func cmdMerge(branch string) {
+	currentBranch := getHeadBranch()
+	currentHash := getBranchRef(currentBranch)
+	branchHash := getBranchRef(branch)
+
+	if currentHash == "" {
+		fmt.Println("错误：当前分支没有提交记录")
+		return
+	}
+	if branchHash == "" {
+		fmt.Printf("错误：分支 '%s' 不存在\n", branch)
+		return
+	}
+	if currentHash == branchHash {
+		fmt.Println("已经在同一个提交上了，无需合并")
+		return
+	}
+
+	// 检查是不是快进合并（当前分支是目标分支的祖先）
+	if isAncestor(currentHash, branchHash) {
+		// 快进：直接把当前分支指针移到目标分支那里
+		setBranchRef(currentBranch, branchHash)
+		fmt.Printf("快进合并: 将 %s 向前推进到 %s\n", currentBranch, branchHash[:8])
+		fmt.Printf("[%s %s] merge branch '%s'\n", currentBranch, branchHash[:8], branch)
+		return
+	}
+
+	// 非快进：创建一个合并提交
+	// tree 沿用当前分支的 tree（简单粗暴）
+	info := parseCommit(currentHash)
+	if info == nil {
+		fmt.Println("错误：无法读取当前提交")
+		return
+	}
+
+	commit := &object.Commit{
+		TreeHash: info.treeHash,
+		Parents:  []string{currentHash, branchHash},
+		Author:   getAuthor(),
+		Message:  object.MergeMessage(branch),
+		Time:     time.Now(),
+	}
+	commitHash, err := store.Write(commit)
+	if err != nil {
+		fmt.Printf("写入合并提交失败: %v\n", err)
+		return
+	}
+
+	if err := setBranchRef(currentBranch, commitHash); err != nil {
+		fmt.Printf("更新分支引用失败: %v\n", err)
+		return
+	}
+
+	fmt.Printf("合并分支 '%s' 到 %s\n", branch, currentBranch)
+	fmt.Printf("合并提交: %s\n", commitHash[:8])
 }
