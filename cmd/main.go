@@ -7,7 +7,7 @@
 //   xit merge <分支>          合并分支
 //
 // 顺带把 Commit.Parent 改成了 Parents（支持多个），
-// 这样合并提交就能有两个爸爸了。
+。
 package main
 
 import (
